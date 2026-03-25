@@ -39,6 +39,7 @@ use google_cloud_storage::retry_policy::RetryableErrors;
 use humantime::parse_duration;
 use instrumented_future::Instrumented;
 use instrumented_retry::DebugRetry;
+use opentelemetry_sdk::trace::{SdkTracerProvider, TraceError};
 use rand::{
     RngExt,
     distr::{Alphanumeric, Uniform},
@@ -47,6 +48,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinSet;
+use tracing::Instrument;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(900);
 
@@ -59,10 +62,9 @@ async fn main() -> anyhow::Result<()> {
     if args.min_delete_batch > args.max_delete_batch {
         return Err(anyhow::Error::msg("invalid delete batch size range"));
     }
-    if args.reqwest_logs {
-        tracing_log::LogTracer::init()?;
-    }
-    enable_tracing(&args);
+    tracing_log::LogTracer::init()?;
+    let credentials = CredentialsBuilder::default().build()?;
+    let tracer_provider = enable_tracing(&args, &credentials).await?;
     tracing::info!("{args:?}");
 
     let handle = tokio::runtime::Handle::current();
@@ -75,10 +77,9 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(frequency).await;
         }
     });
-
-    let credentials = CredentialsBuilder::default().build()?;
     let client = Storage::builder()
         .with_credentials(credentials.clone())
+        .with_tracing()
         .build()
         .await?;
 
@@ -92,21 +93,24 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     );
     tracing::info!("random data ready");
+
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * args.task_count);
     let test_start = Instant::now();
-    let tasks = (0..args.task_count)
-        .map(|task| {
-            tokio::spawn(runner(
-                task,
-                test_start,
-                client.clone(),
-                credentials.clone(),
-                buffer.clone(),
-                tx.clone(),
-                args.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut tasks = JoinSet::new();
+    for task in 0..args.task_count {
+        let span = tracing::info_span!("w1r3.task", task_id = task);
+        let client = client.clone();
+        let credentials = credentials.clone();
+        let buffer = buffer.clone();
+        let tx = tx.clone();
+        let args = args.clone();
+        tasks.spawn(async move {
+            let result = runner(task, test_start, client, credentials, buffer, tx, args)
+                .instrument(span)
+                .await;
+            (task, result)
+        });
+    }
     drop(tx);
 
     println!("{}", Sample::HEADER);
@@ -117,14 +121,25 @@ async fn main() -> anyhow::Result<()> {
     let counters = BTreeMap::from_iter(counters());
     tracing::info!("Counters = {counters:?}");
 
-    for (id, t) in tasks.into_iter().enumerate() {
-        match t.await {
-            Err(e) => tracing::error!("cannot join task {id}: {e}"),
-            Ok(Err(e)) => tracing::error!("error in task {id}: {e}"),
-            Ok(Ok(_)) => {}
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((_, Ok(_))) => {}
+            Ok((id, Err(e))) => tracing::error!("error in task {id}: {e}"),
+            // If tracking which task failed to join ever becomes important, note that
+            // AbortHandle returned by JoinSet::spawn has an id() method which returns
+            // a tokio::task::Id. Since JoinError::id() also returns this exact same
+            // tokio::task::Id, the task_id can be retrieved if a suitable map is created.
+            Err(e) => tracing::error!("a task failed to join: {e}"),
         }
     }
     tracing::info!("DONE");
+
+    if let Some(tracer_provider) = tracer_provider {
+        if let Err(e) = tracer_provider.shutdown() {
+            eprintln!("error shutting down trace provider: {e}");
+        }
+    }
+
     Ok(())
 }
 
@@ -171,6 +186,7 @@ async fn runner(
             (Operation::SingleShot, size + 1)
         };
 
+        let upload_span = tracing::info_span!("w1r3.upload", op = %write_op.name(), size);
         let builder = SampleBuilder::new(&task, iteration, write_op, size, name.clone());
         let upload = match upload(
             &client,
@@ -180,6 +196,7 @@ async fn runner(
             buffer.slice(0..size),
             threshold,
         )
+        .instrument(upload_span)
         .await
         {
             Ok(u) => {
@@ -197,7 +214,11 @@ async fn runner(
         for i in 0..(args.read_count) {
             let op = Operation::Read(i);
             let builder = SampleBuilder::new(&task, iteration, op, size, upload.name.clone());
-            let sample = match download(&client, &args, &upload).await {
+            let download_span = tracing::info_span!("w1r3.download", read_index = i, size);
+            let sample = match download(&client, &args, &upload)
+                .instrument(download_span)
+                .await
+            {
                 (_, Ok(_)) => builder.success(),
                 (0, Err(e)) => builder.error(&e),
                 (partial, Err(e)) => builder.interrupted(partial, &e),
@@ -209,6 +230,7 @@ async fn runner(
         }
         if deletes.len() >= batch_size {
             batch_size = rand::rng().sample(batch_size_gen);
+            let delete_span = tracing::info_span!("w1r3.delete_batch", batch_size = deletes.len());
             batch_delete(
                 &task,
                 iteration,
@@ -216,9 +238,11 @@ async fn runner(
                 deletes.drain(..),
                 name.as_str(),
             )
+            .instrument(delete_span)
             .await;
         }
     }
+    let delete_span = tracing::info_span!("w1r3.delete_batch", batch_size = deletes.len());
     batch_delete(
         &task,
         args.iterations,
@@ -226,6 +250,7 @@ async fn runner(
         deletes.into_iter(),
         "N/A",
     )
+    .instrument(delete_span)
     .await;
     Ok(())
 }
@@ -610,7 +635,10 @@ fn counters() -> impl Iterator<Item = (&'static str, u64)> {
     .into_iter()
 }
 
-fn enable_tracing(args: &Args) {
+async fn enable_tracing(
+    _args: &Args,
+    _credentials: &Credentials,
+) -> Result<Option<SdkTracerProvider>, TraceError> {
     use tracing_subscriber::fmt::format::{self, FmtSpan};
     use tracing_subscriber::prelude::*;
 
@@ -643,21 +671,36 @@ fn enable_tracing(args: &Args) {
     // formatter so that a delimiter is added between fields.
     .delimited("; ");
 
-    let subscriber = tracing_subscriber::fmt()
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_level(true)
         .with_thread_ids(true)
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .with_writer(std::io::stderr)
-        .fmt_fields(formatter);
-    let subscriber = if !args.reqwest_logs {
-        subscriber.with_max_level(tracing::Level::INFO)
-    } else {
-        subscriber.with_max_level(tracing::Level::TRACE)
-    };
-    let subscriber = subscriber.finish();
+        .fmt_fields(formatter)
+        .with_filter(env_filter);
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting global subscriber succeeds");
+    let registry = tracing_subscriber::Registry::default().with(fmt_layer);
+
+    #[cfg(google_cloud_unstable_tracing)]
+    if let Some(project_id) = &_args.project_id {
+        let tracer_provider =
+            integration_tests_o11y::otlp::trace::Builder::new(project_id, "storage-w1r3")
+                .with_credentials(_credentials.clone())
+                .build()
+                .await
+                .inspect_err(|e| eprintln!("failed to create tracer provider: {e:?}"))?;
+        // integration_tests_o11y::tracing::trace_layer already has an EnvFilter set on it.
+        let otel_layer = integration_tests_o11y::tracing::trace_layer(tracer_provider.clone());
+        tracing::subscriber::set_global_default(registry.with(otel_layer))
+            .expect("setting global subscriber succeeds");
+        return Ok(Some(tracer_provider));
+    }
+
+    tracing::subscriber::set_global_default(registry).expect("setting global subscriber succeeds");
+    Ok(None)
 }
 
 /// Runs the W1R3 benchmark for the Rust client library.
@@ -721,13 +764,17 @@ struct Args {
     #[arg(long)]
     no_delete: bool,
 
-    /// Enable logs in the `reqwest` layer.
-    #[arg(long)]
-    reqwest_logs: bool,
-
     /// Enable logs for the retry policies.
     #[arg(long)]
     debug_retry: bool,
+
+    /// A Google Cloud project ID used to send tracing data.
+    ///
+    /// When set, enables OpenTelemetry export to Cloud Trace via
+    /// telemetry.googleapis.com.
+    #[cfg(google_cloud_unstable_tracing)]
+    #[arg(long)]
+    project_id: Option<String>,
 }
 
 fn parse_size_arg(arg: &str) -> anyhow::Result<u64> {

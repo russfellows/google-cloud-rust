@@ -30,7 +30,6 @@ rust-version.workspace = true
 async-trait.workspace = true
 bytes.workspace       = true
 http.workspace        = true
-lazy_static.workspace = true
 prost.workspace       = true
 prost-types.workspace = true
 serde.workspace       = true
@@ -54,9 +53,8 @@ default = ["default-rustls-provider"]
 default-rustls-provider = ["gaxi/_default-rustls-provider"]
 
 [dev-dependencies]
-anyhow.workspace     = true
-tokio                = { workspace = true, features = ["full", "macros"] }
-tokio-test.workspace = true
+anyhow.workspace = true
+tokio            = { workspace = true, features = ["full", "macros"] }
 
 [lints]
 workspace = true

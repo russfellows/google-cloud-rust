@@ -14,7 +14,7 @@
 
 [package]
 name        = "google-cloud-storage"
-version     = "1.9.0"
+version     = "1.10.0"
 description = "Google Cloud Client Libraries for Rust - Storage"
 # Inherit other attributes from the workspace.
 edition.workspace      = true
@@ -41,7 +41,6 @@ http.workspace             = true
 futures.workspace          = true
 http-body.workspace        = true
 hyper.workspace            = true
-lazy_static.workspace      = true
 md5.workspace              = true
 percent-encoding.workspace = true
 pin-project.workspace      = true
@@ -99,8 +98,7 @@ serial_test.workspace       = true
 static_assertions           = { workspace = true }
 test-case.workspace         = true
 tempfile.workspace          = true
-tokio-test.workspace        = true
-tokio.workspace             = true
+tokio                       = { workspace = true, features = ["test-util"] }
 pretty_assertions.workspace = true
 # The tests use `unstable-stream`, which is not enabled by default.
 google-cloud-storage    = { path = ".", features = ["unstable-stream"] }

@@ -14,6 +14,7 @@
 
 use crate::client::Spanner;
 use crate::model::Session;
+use crate::partitioned_dml_transaction::PartitionedDmlTransactionBuilder;
 use crate::read_only_transaction::{
     MultiUseReadOnlyTransactionBuilder, SingleUseReadOnlyTransactionBuilder,
 };
@@ -96,6 +97,83 @@ impl DatabaseClient {
     /// but don't permit data modifications. Read-only transactions do not take locks.
     pub fn read_only_transaction(&self) -> MultiUseReadOnlyTransactionBuilder {
         MultiUseReadOnlyTransactionBuilder::new(self.clone())
+    }
+
+    /// Returns a builder for a partitioned DML transaction.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::{Spanner, Statement};
+    /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let transaction = db_client.partitioned_dml_transaction().build().await?;
+    /// let statement = Statement::builder("UPDATE users SET active = true WHERE TRUE").build();
+    /// let modified_rows = transaction.execute_update(statement).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Partitioned DML is used to execute a single DML statement that may modify a large number
+    /// of rows. The execution of the statement will automatically be partitioned into smaller
+    /// transactions by Spanner, which may execute in parallel.
+    ///
+    /// See also: <https://docs.cloud.google.com/spanner/docs/dml-partitioned>
+    pub fn partitioned_dml_transaction(&self) -> PartitionedDmlTransactionBuilder {
+        PartitionedDmlTransactionBuilder::new(self.clone())
+    }
+
+    /// Returns a builder for a read-write transaction runner.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::{Spanner, Statement};
+    /// # async fn build(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let runner = db_client.read_write_transaction().build().await?;
+    /// let result = runner.run(async |transaction| {
+    ///     let statement = Statement::builder("UPDATE users SET active = true WHERE id = 1").build();
+    ///     transaction.execute_update(statement).await?;
+    ///     Ok(())
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Read-write transactions can be used to execute multiple queries and updates
+    /// atomically. If the transaction is aborted by Spanner, the `run` method will
+    /// automatically retry the transaction.
+    pub fn read_write_transaction(&self) -> crate::transaction_runner::TransactionRunnerBuilder {
+        crate::transaction_runner::TransactionRunnerBuilder::new(self.clone())
+    }
+
+    /// Returns a builder for a write-only transaction.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use google_cloud_spanner::client::{Mutation, Spanner};
+    /// # async fn test_doc() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Spanner::builder().build().await?;
+    /// let db = client.database_client("projects/p/instances/i/databases/d").build().await?;
+    ///
+    /// let mutation = Mutation::new_insert_builder("Users")
+    ///     .set("UserId").to(&1)
+    ///     .set("UserName").to(&"Alice")
+    ///     .build();
+    ///
+    /// let response = db.write_only_transaction()
+    ///     .with_transaction_tag("my-tag")
+    ///     .build()
+    ///     .write(vec![mutation])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A write-only transaction is used to execute blind writes using mutations.
+    pub fn write_only_transaction(
+        &self,
+    ) -> crate::write_only_transaction::WriteOnlyTransactionBuilder {
+        crate::write_only_transaction::WriteOnlyTransactionBuilder::new(self.clone())
     }
 }
 

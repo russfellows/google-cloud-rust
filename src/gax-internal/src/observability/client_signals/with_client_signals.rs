@@ -28,7 +28,8 @@ use crate::observability::errors::ErrorType;
 use google_cloud_gax::error::Error;
 use google_cloud_gax::error::rpc::Code;
 use opentelemetry_semantic_conventions::attribute::{
-    ERROR_TYPE, HTTP_RESPONSE_STATUS_CODE, RPC_METHOD, URL_DOMAIN, URL_TEMPLATE,
+    ERROR_TYPE, EXCEPTION_MESSAGE, EXCEPTION_TYPE, HTTP_RESPONSE_STATUS_CODE, RPC_METHOD,
+    URL_DOMAIN, URL_TEMPLATE,
 };
 use pin_project::pin_project;
 use std::future::Future;
@@ -130,30 +131,23 @@ where
                     .status()
                     .map(|s| s.code.name())
                     .unwrap_or(Code::Unknown.name());
-                if let Some(http_code) = error.http_status_code() {
-                    // TODO(#4795) - use the correct name and target
+                let error_str = error_type.as_str();
+                let err_msg = error.to_string();
+
+                // TODO(#4795) - use the correct name and target
+                if !this.start.disable_actionable_error_logging() {
                     tracing::event!(
                         name: NAME,
                         target: TARGET,
-                        tracing::Level::ERROR,
+                        tracing::Level::WARN,
                         { RPC_SYSTEM_NAME } = RPC_SYSTEM_HTTP,
                         { URL_DOMAIN } = this.start.info().default_host,
                         { URL_TEMPLATE } = this.start.url_template(),
                         { RPC_METHOD } = this.start.method(),
                         { RPC_RESPONSE_STATUS_CODE } = rpc_status_code,
-                        { HTTP_RESPONSE_STATUS_CODE } = http_code,
-                        "{error:?}"
-                    );
-                } else {
-                    tracing::event!(
-                        name: NAME,
-                        target: TARGET,
-                        tracing::Level::ERROR,
-                        { RPC_SYSTEM_NAME } = RPC_SYSTEM_HTTP,
-                        { URL_DOMAIN } = this.start.info().default_host,
-                        { URL_TEMPLATE } = this.start.url_template(),
-                        { RPC_METHOD } = this.start.method(),
-                        { RPC_RESPONSE_STATUS_CODE } = rpc_status_code,
+                        { HTTP_RESPONSE_STATUS_CODE } = error.http_status_code(),
+                        { EXCEPTION_TYPE } = error_str,
+                        { EXCEPTION_MESSAGE } = err_msg,
                         "{error:?}"
                     );
                 }
@@ -304,6 +298,11 @@ mod tests {
             &[
                 ("rpc.method", METHOD),
                 ("rpc.response.status_code", "NOT_FOUND"),
+                ("exception.type", "NOT_FOUND"),
+                (
+                    "exception.message",
+                    "the service reports an error with code NOT_FOUND described as: NOT FOUND",
+                ),
             ],
         );
 
@@ -365,6 +364,11 @@ mod tests {
                 ("rpc.method", METHOD),
                 ("rpc.response.status_code", "UNKNOWN"),
                 ("http.response.status_code", "429"),
+                ("exception.type", "429"),
+                (
+                    "exception.message",
+                    "the HTTP transport reports a [429] error: ",
+                ),
             ],
         );
 
@@ -434,5 +438,51 @@ mod tests {
 
     fn http_too_many_requests() -> Error {
         Error::http(429, http::HeaderMap::new(), bytes::Bytes::new())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_err_suppresses_actionable_logs() -> anyhow::Result<()> {
+        let providers = SignalProviders::new();
+
+        let span = tracing::info_span!(
+            "client_request",
+            { OTEL_STATUS_CODE } = otel_status_codes::UNSET,
+            { ERROR_TYPE } = ::tracing::field::Empty,
+            { OTEL_STATUS_DESCRIPTION } = ::tracing::field::Empty
+        );
+
+        let metric = DurationMetric::new_with_provider(
+            &TEST_INFO,
+            Arc::new(providers.metric_provider.clone()),
+        );
+        use google_cloud_gax::options::internal::RequestOptionsExt;
+        let options = RequestOptions::default()
+            .insert_extension(PathTemplate(URL_TEMPLATE))
+            .insert_extension(crate::observability::client_signals::SuppressActionableErrorLog);
+        let start = RequestStart::new(&TEST_INFO, &options, METHOD);
+
+        let future = ready(Err::<String, Error>(not_found()));
+        let future = WithClientSignals::new(future, metric.clone(), start, span.clone());
+        let result = future.await;
+
+        assert!(
+            matches!(result, Err(ref e) if e.status() == not_found().status()),
+            "{result:?}"
+        );
+
+        drop(span);
+        providers.force_flush()?;
+
+        let captured = providers.logs_exporter.get_emitted_logs()?;
+        let record = captured
+            .iter()
+            .find(|r| r.record.target().is_some_and(|v| v == TARGET));
+
+        assert!(
+            record.is_none(),
+            "unexpected actionable log record found: {record:?}"
+        );
+
+        Ok(())
     }
 }

@@ -55,6 +55,9 @@ locals {
       script = "coverage"
       flags  = local.unstable_flags
     }
+    crypto-providers = {
+      config = "cryptoproviders.yaml"
+    }
     deny = {
       config = "complex.yaml"
       script = "deny"
@@ -139,7 +142,7 @@ locals {
       config       = "complex.yaml"
       flags        = local.unstable_flags
       script       = "test"
-      rust_version = "1.85"
+      rust_version = "1.86"
     }
     test-unstable-cfg = {
       config = "complex.yaml"

@@ -15,6 +15,7 @@
 use crate::database_client::DatabaseClient;
 use crate::model::TransactionOptions;
 use crate::model::transaction_options::ReadOnly;
+use crate::precommit::PrecommitTokenTracker;
 use crate::result_set::ResultSet;
 use crate::statement::Statement;
 use crate::timestamp_bound::TimestampBound;
@@ -88,7 +89,11 @@ impl SingleUseReadOnlyTransactionBuilder {
             .set_single_use(TransactionOptions::default().set_read_only(read_only));
 
         SingleUseReadOnlyTransaction {
-            context: ReadContext::new(self.client, transaction_selector),
+            context: ReadContext::new(
+                self.client,
+                transaction_selector,
+                PrecommitTokenTracker::new_noop(),
+            ),
         }
     }
 }
@@ -141,6 +146,42 @@ impl SingleUseReadOnlyTransaction {
         statement: T,
     ) -> crate::Result<ResultSet> {
         self.context.execute_query(statement).await
+    }
+
+    /// Reads rows from the database using key lookups and scans, as a simple key/value style alternative to execute_query.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::{Spanner, ReadRequest, KeySet};
+    /// # use google_cloud_spanner::key;
+    /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let transaction = db_client.single_use().build();
+    ///
+    /// // Read using the primary key
+    /// let read_by_pk = ReadRequest::builder("Users", vec!["Id", "Name"]).with_keys(KeySet::all()).build();
+    /// let mut result_set = transaction.execute_read(read_by_pk).await?;
+    /// while let Some(row) = result_set.next().await {
+    ///     let _row = row?;
+    ///     // process row
+    /// }
+    ///
+    /// // Read using a secondary index
+    /// let read_by_index = ReadRequest::builder("Users", vec!["Id", "Name"])
+    ///     .with_index("UsersByIndex", key![1_i64]).build();
+    /// let mut result_set = transaction.execute_read(read_by_index).await?;
+    /// while let Some(row) = result_set.next().await {
+    ///     let _row = row?;
+    ///     // process row
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_read<T: Into<crate::read::ReadRequest>>(
+        &self,
+        read: T,
+    ) -> crate::Result<ResultSet> {
+        self.context.execute_read(read).await
     }
 }
 
@@ -220,7 +261,11 @@ impl MultiUseReadOnlyTransactionBuilder {
 
         let transaction_selector = crate::model::TransactionSelector::default().set_id(response.id);
         Ok(MultiUseReadOnlyTransaction {
-            context: ReadContext::new(self.client, transaction_selector),
+            context: ReadContext::new(
+                self.client,
+                transaction_selector,
+                PrecommitTokenTracker::new_noop(),
+            ),
             read_timestamp: response.read_timestamp,
         })
     }
@@ -285,22 +330,61 @@ impl MultiUseReadOnlyTransaction {
     ) -> crate::Result<ResultSet> {
         self.context.execute_query(statement).await
     }
+
+    /// Reads rows from the database using key lookups and scans, as a simple key/value style alternative to execute_query.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::{Spanner, ReadRequest, KeySet};
+    /// # use google_cloud_spanner::key;
+    /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let transaction = db_client.read_only_transaction().build().await?;
+    ///
+    /// // Read using the primary key
+    /// let read_by_pk = ReadRequest::builder("Users", vec!["Id", "Name"]).with_keys(KeySet::all()).build();
+    /// let mut result_set = transaction.execute_read(read_by_pk).await?;
+    /// while let Some(row) = result_set.next().await {
+    ///     let _row = row?;
+    ///     // process row
+    /// }
+    ///
+    /// // Read using a secondary index
+    /// let read_by_index = ReadRequest::builder("Users", vec!["Id", "Name"])
+    ///     .with_index("UsersByIndex", key![1_i64]).build();
+    /// let mut result_set = transaction.execute_read(read_by_index).await?;
+    /// while let Some(row) = result_set.next().await {
+    ///     let _row = row?;
+    ///     // process row
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_read<T: Into<crate::read::ReadRequest>>(
+        &self,
+        read: T,
+    ) -> crate::Result<ResultSet> {
+        self.context.execute_read(read).await
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadContext {
-    client: DatabaseClient,
-    transaction_selector: crate::model::TransactionSelector,
+    pub(crate) client: DatabaseClient,
+    pub(crate) transaction_selector: crate::model::TransactionSelector,
+    pub(crate) precommit_token_tracker: PrecommitTokenTracker,
 }
 
 impl ReadContext {
     pub(crate) fn new(
         client: DatabaseClient,
         transaction_selector: crate::model::TransactionSelector,
+        precommit_token_tracker: PrecommitTokenTracker,
     ) -> Self {
         Self {
             client,
             transaction_selector,
+            precommit_token_tracker,
         }
     }
 
@@ -325,12 +409,44 @@ impl ReadContext {
             .send()
             .await?;
 
-        Ok(ResultSet::new(stream))
+        Ok(ResultSet::new(stream, self.precommit_token_tracker.clone()))
+    }
+
+    pub(crate) async fn execute_read<T: Into<crate::read::ReadRequest>>(
+        &self,
+        read: T,
+    ) -> crate::Result<ResultSet> {
+        let read = read.into();
+
+        let mut request = crate::model::ReadRequest::default()
+            .set_session(self.client.session.name.clone())
+            .set_transaction(self.transaction_selector.clone())
+            .set_table(read.table)
+            .set_columns(read.columns)
+            .set_key_set(read.keys.into_proto());
+
+        if let Some(index) = read.index {
+            request = request.set_index(index);
+        }
+
+        if let Some(limit) = read.limit {
+            request = request.set_limit(limit);
+        }
+
+        let stream = self
+            .client
+            .spanner
+            // TODO(#4972): make request options configurable
+            .streaming_read(request, crate::RequestOptions::default())
+            .send()
+            .await?;
+
+        Ok(ResultSet::new(stream, self.precommit_token_tracker.clone()))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -342,7 +458,7 @@ mod tests {
         static_assertions::assert_impl_all!(ReadContext: Send, Sync, std::fmt::Debug);
     }
 
-    fn create_session_mock() -> spanner_grpc_mock::MockSpanner {
+    pub(crate) fn create_session_mock() -> spanner_grpc_mock::MockSpanner {
         let mut mock = spanner_grpc_mock::MockSpanner::new();
         mock.expect_create_session().once().returning(|_| {
             Ok(gaxi::grpc::tonic::Response::new(
@@ -371,7 +487,7 @@ mod tests {
         }
     }
 
-    async fn setup_db_client(
+    pub(crate) async fn setup_db_client(
         mock: spanner_grpc_mock::MockSpanner,
     ) -> (DatabaseClient, tokio::task::JoinHandle<()>) {
         use crate::client::Spanner;
@@ -545,5 +661,41 @@ mod tests {
             let result = rs.next().await;
             assert!(result.is_none(), "expected None, got {result:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn execute_single_read() {
+        use super::super::result_set::tests::string_val;
+        use crate::client::{KeySet, ReadRequest};
+        use crate::value::Value;
+
+        let mut mock = create_session_mock();
+
+        mock.expect_streaming_read().once().returning(|req| {
+            let req = req.into_inner();
+            assert_eq!(
+                req.session,
+                "projects/p/instances/i/databases/d/sessions/123"
+            );
+            assert_eq!(req.table, "Users");
+            assert_eq!(req.columns, vec!["Id".to_string(), "Name".to_string()]);
+
+            Ok(gaxi::grpc::tonic::Response::new(Box::pin(
+                tokio_stream::iter(vec![Ok(setup_select1())]),
+            )))
+        });
+
+        let (db_client, _server) = setup_db_client(mock).await;
+
+        let tx = db_client.single_use().build();
+        let read = ReadRequest::builder("Users", vec!["Id", "Name"])
+            .with_keys(KeySet::all())
+            .build();
+        let mut rs = tx.execute_read(read).await.expect("Failed to execute read");
+
+        let row = rs.next().await.expect("has row").expect("has valid row");
+        assert_eq!(row.raw_values(), [Value(string_val("1"))]);
+        let result = rs.next().await;
+        assert!(result.is_none(), "expected None, got {result:?}");
     }
 }

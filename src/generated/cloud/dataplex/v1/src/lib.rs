@@ -31,6 +31,7 @@
 //! * [CatalogService](client/struct.CatalogService.html)
 //! * [CmekService](client/struct.CmekService.html)
 //! * [ContentService](client/struct.ContentService.html)
+//! * [DataProductService](client/struct.DataProductService.html)
 //! * [DataTaxonomyService](client/struct.DataTaxonomyService.html)
 //! * [DataScanService](client/struct.DataScanService.html)
 //! * [MetadataService](client/struct.MetadataService.html)
@@ -94,16 +95,15 @@ const DEFAULT_HOST: &str = "https://dataplex.googleapis.com/";
 pub(crate) mod info {
     const NAME: &str = env!("CARGO_PKG_NAME");
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    lazy_static::lazy_static! {
-        pub(crate) static ref X_GOOG_API_CLIENT_HEADER: String = {
-            let ac = gaxi::api_header::XGoogApiClient{
-                name:          NAME,
-                version:       VERSION,
-                library_type:  gaxi::api_header::GAPIC,
+    pub(crate) static X_GOOG_API_CLIENT_HEADER: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| {
+            let ac = gaxi::api_header::XGoogApiClient {
+                name: NAME,
+                version: VERSION,
+                library_type: gaxi::api_header::GAPIC,
             };
             ac.rest_header_value()
-        };
-    }
+        });
 }
 
 // Define some shortcuts for imported crates.

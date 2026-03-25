@@ -22,6 +22,13 @@ pub use duration_metric::DurationMetric;
 pub use request_start::RequestStart;
 pub use with_client_signals::WithClientSignals;
 
+/// An extension to disable terminal actionable error logging.
+///
+/// If this extension is present in the `RequestOptions` supplied to a GAX call,
+/// the terminal application logs will be suppressed.
+#[derive(Clone, Copy, Debug)]
+pub struct SuppressActionableErrorLog;
+
 /// Creates a [Span] and [RequestStart] for a client request.
 ///
 /// # Parameters
@@ -127,12 +134,11 @@ macro_rules! client_request_signals {
 ///
 /// ```
 /// let span = client_request_span!("client::Client", "upload_chunk", &HIDDEN_DETAIL);
+/// # use std::sync::LazyLock;
 /// # use google_cloud_gax_internal::client_request_span;
 /// # use google_cloud_gax_internal::options::InstrumentationClientInfo;
-/// # lazy_static::lazy_static! { static ref HIDDEN_DETAIL: InstrumentationClientInfo = {
-/// #     InstrumentationClientInfo::default()
-/// # };
-/// # }
+/// # static HIDDEN_DETAIL: LazyLock<InstrumentationClientInfo> =
+/// #     LazyLock::new(|| InstrumentationClientInfo::default());
 /// ```
 #[macro_export]
 macro_rules! client_request_span {
@@ -316,6 +322,11 @@ mod tests {
             &[
                 ("rpc.method", FULL_METHOD),
                 ("rpc.response.status_code", "NOT_FOUND"),
+                ("exception.type", "NOT_FOUND"),
+                (
+                    "exception.message",
+                    "the service reports an error with code NOT_FOUND described as: NOT FOUND",
+                ),
             ],
         );
         Ok(())
@@ -492,7 +503,7 @@ mod tests {
             Some(TARGET),
             "{record:?}"
         );
-        assert_eq!(record.severity_text(), Some("ERROR"), "{record:?}");
+        assert_eq!(record.severity_text(), Some("WARN"), "{record:?}");
         assert_eq!(
             record.trace_context().map(|c| c.trace_id),
             Some(trace_id),
