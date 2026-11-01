@@ -78,6 +78,33 @@ pub struct Client {
     extensions: crate::options::Extensions,
 }
 
+/// Default HTTP/2 initial connection and per-stream window size (MiB).
+const DEFAULT_WINDOW_MIB: u64 = 128;
+
+/// Environment variable overriding [`DEFAULT_WINDOW_MIB`]. Integer MiB; `0`
+/// keeps the HTTP/2 protocol default (64 KiB).
+const ENV_GRPC_INITIAL_WINDOW_MIB: &str = "S3DLIO_GRPC_INITIAL_WINDOW_MIB";
+
+/// s3dlio fork patch: HTTP/2 flow-control window tuning and `TCP_NODELAY`.
+///
+/// The HTTP/2 default stream window (65,535 bytes) caps a single gRPC stream at
+/// roughly 64 MB/s on a 1 ms same-region link. A large window leaves only the
+/// NIC and the server as the bottleneck.
+fn tune_http2_windows(endpoint: ::tonic::transport::Endpoint) -> ::tonic::transport::Endpoint {
+    let window_mib = std::env::var(ENV_GRPC_INITIAL_WINDOW_MIB)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WINDOW_MIB);
+    if window_mib == 0 {
+        return endpoint;
+    }
+    let window_bytes = window_mib.saturating_mul(1024 * 1024).min(u32::MAX as u64) as u32;
+    endpoint
+        .initial_connection_window_size(window_bytes)
+        .initial_stream_window_size(window_bytes)
+        .tcp_nodelay(true)
+}
+
 impl Client {
     /// Create a new client.
     pub async fn new(
@@ -697,7 +724,7 @@ impl Client {
         if let Some(limit) = grpc_max_header_list_size {
             endpoint = endpoint.http2_max_header_list_size(limit);
         }
-        Ok(endpoint)
+        Ok(tune_http2_windows(endpoint))
     }
 
     pub fn get_polling_error_policy(
